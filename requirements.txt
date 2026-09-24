@@ -4,3 +4,4 @@ pandas
 openpyxl
 rapidfuzz
 python-multipart
+streamlit
