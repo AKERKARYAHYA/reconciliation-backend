@@ -3,7 +3,7 @@ import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
-# استدعاء الملفات بالسميات الصحيحة ديالهم
+# Importation des modules
 import app123
 import apvsbmcil
 import apvscaml
@@ -50,7 +50,7 @@ async def reconcile(
                 "unmatched_rlv": un_rlv.fillna("").astype(str).to_dict(orient="records"),
             }
 
-        # ENGINE 2
+        # ENGINE 2 (BMCI)
         elif engine == "engine_2":
             erp_df = apvsbmcil.prepare(apvsbmcil.read_upload(io.BytesIO(erp_bytes)))
             rlv_df = apvsbmcil.prepare(apvsbmcil.read_upload(io.BytesIO(rlv_bytes)))
@@ -68,20 +68,35 @@ async def reconcile(
                 "unmatched_rlv": un_rlv.fillna("").astype(str).to_dict(orient="records"),
             }
 
-        # ENGINE 3 (apvscaml.py)
+        # ENGINE 3 (CAML - apvscaml.py)
         elif engine == "engine_3":
-            df_erp, df_rlv = apvscaml.charger_donnees(erp_bytes)
-            matched_df, unmatched_rlv_df = apvscaml.lancer_rapprochement(df_erp, df_rlv)
+            # Direct mock class pour adapter le buffer bytes au format attendu
+            class NamedBytesIO(io.BytesIO):
+                def __init__(self, initial_bytes, name):
+                    super().__init__(initial_bytes)
+                    self.name = name
+
+            erp_uploaded = NamedBytesIO(erp_bytes, erp_file.filename)
+            rlv_uploaded = NamedBytesIO(rlv_bytes, rlv_file.filename)
+
+            erp_df = apvscaml.prepare(apvscaml.read_upload(erp_uploaded))
+            rlv_df = apvscaml.prepare(apvscaml.read_upload(rlv_uploaded))
+
+            matches, em, rm = apvscaml.reconcile(erp_df, rlv_df)
+            _, matched_df, unmatched_df = apvscaml.build_outputs(erp_df, rlv_df, matches, em, rm)
+
+            un_erp = unmatched_df[unmatched_df["Source"] == "ERP"]
+            un_rlv = unmatched_df[unmatched_df["Source"] == "RLV"]
 
             return {
                 "status": "success",
                 "matched": matched_df.fillna("").astype(str).to_dict(orient="records"),
-                "unmatched_erp": [],
-                "unmatched_rlv": unmatched_rlv_df.fillna("").astype(str).to_dict(orient="records"),
+                "unmatched_erp": un_erp.fillna("").astype(str).to_dict(orient="records"),
+                "unmatched_rlv": un_rlv.fillna("").astype(str).to_dict(orient="records"),
             }
 
         else:
-            return {"status": "error", "message": "المحرك غير معروف"}
+            return {"status": "error", "message": "Engine khawi wla machi m'3rref"}
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
