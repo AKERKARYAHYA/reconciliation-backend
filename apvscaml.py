@@ -1,38 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-BMCI Bank Reconciliation — Streamlit application
-================================================
-Two-phase ERP ⇄ RLV (bank statement) reconciliation with strict chronological
-and weekday constraints.
-
-Rules
------
-* Process ONLY 'Credit' transactions (debit rows are ignored entirely).
-* Chronological constraint : ERP date <= RLV date.
-* Strict date window (ERP → RLV):
-    - ERP on Saturday  → match ONLY with the following Monday.
-    - any other day    → match with the SAME day or DAY + 1.
-* A row matched in one phase is excluded from every later phase (no double count).
-
-Phase 1 — Direct reference search
-    ERP `reference` found literally inside RLV `description`,
-    identical Credit amount, within the date window. (1 ERP ⇄ 1 RLV)
-
-Phase 2 — Aggregation on "VERSEMENT ESP"
-    RLV restricted to descriptions containing "VERSEMENT ESP".
-    ERP grouped by reference (a match may involve 1 or 2 references on the same date).
-    A combination of 2 to 8 RLV rows (same date) whose Credit sum equals the
-    ERP Credit sum, within the date window.
-
-Phase 3 — Same-reference ERP aggregation → single RLV row
-    Among the rows still unmatched, an ERP reference carrying several Credit lines
-    on the same date is summed and matched to ONE RLV row whose Credit equals that
-    total (any description), within the same date window.
-
-Run
----
-    pip install streamlit pandas openpyxl
-    streamlit run bmci_reconciliation_app.py
+BMCI / CAML Bank Reconciliation Engine
 """
 
 import io
@@ -70,7 +38,7 @@ def to_num(series: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce").fillna(0.0)
     cleaned = (series.astype(str)
-               .str.replace(" ", "", regex=False)
+               .str.replace(" ", "", regex=False)
                .str.replace(" ", "", regex=False)
                .str.replace(",", ".", regex=False)
                .str.replace(r"[^0-9.\-]", "", regex=True))
@@ -96,10 +64,9 @@ def parse_date_val(v):
 
 def read_upload(upload):
     """Read an uploaded Excel/CSV file into a DataFrame (first sheet for Excel)."""
-    name = upload.name.lower()
+    name = getattr(upload, "name", "file.xlsx").lower()
     if name.endswith((".xlsx", ".xlsm", ".xls")):
         sheets = pd.read_excel(upload, sheet_name=None)
-        # prefer a sheet named like erp/rlv, else the first
         for s in sheets:
             if deaccent(s) in ("erp", "rlv"):
                 return sheets[s]
@@ -120,7 +87,6 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     out["credit"] = to_num(df[cred_c]) if cred_c else 0.0
     out["reference"] = (df[ref_c].astype(str).str.strip().replace({"nan": "", "None": ""})
                         if ref_c else "")
-    # Searchable description = every text column except the date column.
     text_cols = [c for c in cols if c != date_c
                  and not pd.api.types.is_numeric_dtype(df[c])
                  and not pd.api.types.is_datetime64_any_dtype(df[c])]
@@ -132,16 +98,15 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def date_ok(ed, rd) -> bool:
-    """ERP→RLV strict date window (already enforces ERP date <= RLV date)."""
+    """ERP->RLV strict date window."""
     if pd.isna(ed) or pd.isna(rd):
         return False
-    if ed.weekday() == 5:                          # Saturday → following Monday only
+    if ed.weekday() == 5:
         return rd == ed + pd.Timedelta(days=2)
-    return rd == ed or rd == ed + pd.Timedelta(days=1)   # same day or +1
+    return rd == ed or rd == ed + pd.Timedelta(days=1)
 
 
 def find_combo(items, target, kmin=2, kmax=8, guard=2_000_000):
-    """Subset of 2..8 rows whose cents sum == target. Returns indices or None."""
     cand = sorted([(i, c) for i, c in items if 0 < c <= target], key=lambda x: -x[1])
     n = len(cand)
     if n < kmin:
@@ -149,13 +114,13 @@ def find_combo(items, target, kmin=2, kmax=8, guard=2_000_000):
     cents = [c for _, c in cand]
     count = 0
     for k in range(kmin, min(kmax, n) + 1):
-        if sum(cents[:k]) < target:        # k largest can't reach target → try larger k
+        if sum(cents[:k]) < target:
             continue
-        if sum(cents[n - k:]) > target:    # k smallest already exceed → stop
+        if sum(cents[n - k:]) > target:
             break
         for combo in itertools.combinations(range(n), k):
             count += 1
-            if count > guard:              # safety valve against combinatorial blow-up
+            if count > guard:
                 return None
             s = 0
             for j in combo:
@@ -174,7 +139,7 @@ def reconcile(erp: pd.DataFrame, rlv: pd.DataFrame):
     erp_matched, rlv_matched, matches = set(), set(), []
     mid = 0
 
-    # ---------- Phase 1 : direct reference search ----------
+    # Phase 1 : direct reference search
     rlv_by_amt = defaultdict(list)
     for ri in rlv.index:
         rlv_by_amt[rlv.at[ri, "cents"]].append(ri)
@@ -196,8 +161,8 @@ def reconcile(erp: pd.DataFrame, rlv: pd.DataFrame):
             mid += 1
             matches.append({"mid": mid, "type": "Phase 1", "erp": [ei], "rlv": [ri]})
 
-    # ---------- Phase 2 : aggregation on "VERSEMENT ESP" ----------
-    groups = defaultdict(lambda: {"cents": 0, "idx": []})       # (date, reference) → sum
+    # Phase 2 : aggregation on "VERSEMENT ESP"
+    groups = defaultdict(lambda: {"cents": 0, "idx": []})
     for i in erp.index:
         if i in erp_matched or pd.isna(erp.at[i, "date"]):
             continue
@@ -224,7 +189,6 @@ def reconcile(erp: pd.DataFrame, rlv: pd.DataFrame):
                     return combo
         return None
 
-    # singles (1 reference)
     for key in sorted(groups, key=lambda k: (k[0], str(k[1]))):
         date, _ = key
         g = groups[key]
@@ -239,7 +203,6 @@ def reconcile(erp: pd.DataFrame, rlv: pd.DataFrame):
             mid += 1
             matches.append({"mid": mid, "type": "Phase 2", "erp": list(g["idx"]), "rlv": combo})
 
-    # pairs (2 references sharing the same date)
     by_date = defaultdict(list)
     for key in groups:
         by_date[key[0]].append(key)
@@ -258,10 +221,7 @@ def reconcile(erp: pd.DataFrame, rlv: pd.DataFrame):
                 mid += 1
                 matches.append({"mid": mid, "type": "Phase 2", "erp": list(idxs), "rlv": combo})
 
-    # ---------- Phase 3 : same-reference ERP aggregation → single RLV row ----------
-    # A reference carrying several Credit lines on one date: sum them and look for
-    # ONE remaining RLV row whose Credit equals that total (any description),
-    # still within the strict date window.
+    # Phase 3
     groups3 = defaultdict(lambda: {"cents": 0, "idx": []})
     for i in erp.index:
         if i in erp_matched or pd.isna(erp.at[i, "date"]) or not erp.at[i, "reference"]:
@@ -288,11 +248,7 @@ def reconcile(erp: pd.DataFrame, rlv: pd.DataFrame):
     return matches, erp_matched, rlv_matched
 
 
-# ============================================================================
-#  Output workbook
-# ============================================================================
 def build_outputs(erp, rlv, matches, erp_matched, rlv_matched):
-    """Return (excel_bytes, matched_df, unmatched_df)."""
     mrows = []
     for m in matches:
         e_idx, r_idx = m["erp"], m["rlv"]
@@ -350,61 +306,5 @@ def build_outputs(erp, rlv, matches, erp_matched, rlv_matched):
     wb.save(out)
     return out.getvalue(), matched_df, unmatched_df
 
-
-# ============================================================================
-#  Streamlit UI
-# ============================================================================
-st.set_page_config(page_title="Réconciliation BMCI", page_icon="🏦", layout="wide")
-st.title("🏦 Réconciliation BMCI — ERP ⇄ Relevé bancaire")
-st.caption("Rapprochement en deux phases (référence directe + agrégation « VERSEMENT ESP ») "
-           "avec contrainte chronologique et règle Samedi → Lundi. Crédits uniquement.")
-
-c1, c2 = st.columns(2)
-with c1:
-    st.subheader("1️⃣ Fichier ERP")
-    erp_up = st.file_uploader("ERP (Excel ou CSV)", type=["xlsx", "xlsm", "xls", "csv"], key="erp")
-with c2:
-    st.subheader("2️⃣ Fichier RLV (banque)")
-    rlv_up = st.file_uploader("RLV (Excel ou CSV)", type=["xlsx", "xlsm", "xls", "csv"], key="rlv")
-
-if erp_up and rlv_up:
-    try:
-        with st.spinner("Rapprochement en cours…"):
-            erp = prepare(read_upload(erp_up))
-            rlv = prepare(read_upload(rlv_up))
-            matches, em, rm = reconcile(erp, rlv)
-            xlsx_bytes, matched_df, unmatched_df = build_outputs(erp, rlv, matches, em, rm)
-    except Exception as e:
-        st.error(f"Impossible de traiter les fichiers : {e}")
-        st.stop()
-
-    p1 = sum(1 for m in matches if m["type"] == "Phase 1")
-    p2 = sum(1 for m in matches if m["type"] == "Phase 2")
-    p3 = sum(1 for m in matches if m["type"] == "Phase 3")
-    esp_n = int(rlv["desc_lower"].str.contains("versement esp").sum())
-
-    k = st.columns(6)
-    k[0].metric("Crédits ERP", len(erp))
-    k[1].metric("Crédits RLV", len(rlv))
-    k[2].metric("Matchs Phase 1", p1)
-    k[3].metric("Matchs Phase 2", p2)
-    k[4].metric("Matchs Phase 3", p3)
-    k[5].metric("Non rapprochés", f"{len(erp) - len(em)} / {len(rlv) - len(rm)}",
-                help="ERP non rapprochés / RLV non rapprochés")
-
-    st.caption(f"Lignes RLV contenant « VERSEMENT ESP » : {esp_n}")
-
-    st.subheader("✅ Matched_Results")
-    st.dataframe(matched_df, use_container_width=True, hide_index=True)
-    st.subheader("⚠️ Unmatched_Data")
-    st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "⬇️ Télécharger le rapprochement (Excel — 2 feuilles)",
-        data=xlsx_bytes,
-        file_name="BMCI_Reconciliation.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
-else:
-    st.info("⬆️ Téléversez les fichiers ERP et RLV pour lancer le rapprochement.")
+# Alias pour compatibilité
+charger_donnees = read_upload
